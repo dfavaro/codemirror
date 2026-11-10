@@ -1,6 +1,7 @@
 {
   "name": "codemirror-relay",
   "version": "1.0.0",
+  "license": "Apache-2.0",
   "private": true,
   "description": "Zero-knowledge WebSocket binary relay for CodeMirror (GCP Edition)",
   "main": "server.js",

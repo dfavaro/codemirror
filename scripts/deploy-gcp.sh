@@ -59,6 +59,6 @@ printf "VITE_WS_RELAY_URL=%s\n" "${RELAY_WSS_URL}" > client/.env.production
 VITE_WS_RELAY_URL="${RELAY_WSS_URL}" npm run build --prefix client
 
 echo "==> 6. Deploying static SPA bundle to Firebase Hosting"
-firebase deploy --only hosting --project "${PROJECT_ID}"
+firebase deploy --only hosting --project "${PROJECT_ID}" --non-interactive
 
 echo "==> Deployment complete!"

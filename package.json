@@ -1,6 +1,7 @@
 {
   "name": "codemirror-gcp",
   "version": "1.0.0",
+  "license": "Apache-2.0",
   "private": true,
   "description": "CodeMirror (GCP Edition) — A Disposable, Zero-Knowledge Technical Interview & Code Pad",
   "scripts": {

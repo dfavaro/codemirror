@@ -1,0 +1,17 @@
+{
+  "name": "codemirror-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Zero-knowledge WebSocket binary relay for CodeMirror (GCP Edition)",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@google-cloud/firestore": "^7.10.0",
+    "ws": "^8.18.0"
+  }
+}

@@ -11,6 +11,13 @@ import {
 } from "../crypto";
 import { EncryptedWsProvider, RoomMetadata } from "../provider";
 import {
+  attachHostAiResponder,
+  buildSystemPromptWithContext,
+  ChatMessage,
+  CODING_ONLY_SYSTEM_PROMPT,
+  detectProviderFromKey
+} from "../ai";
+import {
   addCursorsToLineEnds,
   handleTabKey,
   insertBlankLineAbove,
@@ -426,5 +433,61 @@ describe("Session Countdown Formatter & Supported Languages", () => {
     expect(registeredKeys).toContain("Shift-Alt-ArrowDown");
     expect(registeredKeys).toContain("Mod-/");
     expect(registeredKeys).toContain("Shift-Alt-a");
+  });
+
+  it("auto-detects BYOK AI providers, enforces coding-only system prompt with live editor context, and executes host-proxied room chat over Yjs", async () => {
+    expect(detectProviderFromKey("sk-ant-api03-test")).toBe("anthropic");
+    expect(detectProviderFromKey("AIzaSyTestGeminiKey")).toBe("gemini");
+    expect(detectProviderFromKey("sk-proj-testOpenAiKey")).toBe("openai");
+
+    const prompt = buildSystemPromptWithContext("kotlin", "val state = MutableStateFlow(0)");
+    expect(prompt).toContain(CODING_ONLY_SYSTEM_PROMPT);
+    expect(prompt).toContain("trip planning");
+    expect(prompt).toContain("Current editor language: kotlin");
+    expect(prompt).toContain("val state = MutableStateFlow(0)");
+
+    // Verify host-browser responder over Y.Doc (Y.Array("chat") + Y.Map("meta"))
+    const doc = new Y.Doc();
+    doc.getText("codemirror").insert(0, "fun add(a: Int, b: Int) = a + b");
+
+    let capturedBody = "";
+    const mockFetch: typeof fetch = async (_url, init) => {
+      capturedBody = String(init?.body ?? "");
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [{ message: { content: "Time complexity is O(1)." } }]
+        })
+      } as Response;
+    };
+
+    const detach = attachHostAiResponder(doc, "sk-proj-mock-host-key", mockFetch);
+    const ymeta = doc.getMap<string>("meta");
+    const ychat = doc.getArray<ChatMessage>("chat");
+
+    expect(ymeta.get("aiEnabled")).toBe("true");
+    expect(ymeta.get("aiProvider")).toBe("openai");
+
+    // Any participant in the room pushes a question to Y.Array("chat")
+    ychat.push([
+      {
+        id: "msg-1",
+        role: "user",
+        content: "What is the time complexity of add?",
+        createdAt: Date.now()
+      }
+    ]);
+
+    await waitForCondition(() => ychat.length === 2);
+
+    const messages = ychat.toArray();
+    expect(messages[1].role).toBe("assistant");
+    expect(messages[1].content).toBe("Time complexity is O(1).");
+    expect(capturedBody).toContain("fun add(a: Int, b: Int) = a + b");
+    expect(ymeta.get("aiThinking")).toBe("false");
+
+    detach();
+    doc.destroy();
   });
 });

@@ -1,3 +1,4 @@
+import { AIProvider, ChatMessage, getProviderLabel } from "./ai";
 import { LANGUAGE_OPTIONS, SupportedLanguage } from "./editor";
 import { ConnectionStatus } from "./provider";
 
@@ -51,11 +52,12 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
 }
 
 /**
- * Renders the minimal centered Homepage with Logo, 1-line description, and "Start session" CTA (FR-1).
+ * Renders the minimal centered Homepage with Logo, 1-line description,
+ * optional AI API key input, and "Start session" CTA (FR-1).
  */
 export function renderLandingView(
   root: HTMLElement,
-  onCreateSession: () => Promise<void>
+  onCreateSession: (aiApiKey?: string) => Promise<void>
 ): void {
   root.innerHTML = `
     <main class="min-h-screen w-full bg-zinc-950 text-zinc-100 flex items-center justify-center px-6">
@@ -71,11 +73,23 @@ export function renderLandingView(
           Disposable, end-to-end encrypted collaborative code pad.
         </p>
 
-        <div class="pt-1">
+        <div class="pt-1 space-y-3 max-w-sm mx-auto">
+          <div>
+            <label for="ai-key-input" class="sr-only">Optional AI API Key</label>
+            <input
+              id="ai-key-input"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="Optional: AI API key (OpenAI, Claude, or Gemini)"
+              class="w-full px-3.5 py-2.5 rounded-lg bg-zinc-900 border border-zinc-800 focus:border-emerald-500 focus:outline-none text-xs sm:text-sm font-mono text-zinc-200 placeholder-zinc-500 transition"
+            />
+          </div>
+
           <button
             id="new-session-btn"
             type="button"
-            class="cursor-pointer inline-flex items-center justify-center gap-2.5 px-6 py-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-zinc-950 font-semibold text-sm sm:text-base shadow-lg shadow-emerald-500/15 transition-all"
+            class="cursor-pointer w-full inline-flex items-center justify-center gap-2.5 px-6 py-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-zinc-950 font-semibold text-sm sm:text-base shadow-lg shadow-emerald-500/15 transition-all"
           >
             <span>Start session</span>
             <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2.2" viewBox="0 0 24 24">
@@ -88,15 +102,30 @@ export function renderLandingView(
   `;
 
   const btn = root.querySelector<HTMLButtonElement>("#new-session-btn");
-  btn?.addEventListener("click", async () => {
+  const aiKeyInput = root.querySelector<HTMLInputElement>("#ai-key-input");
+
+  const triggerCreate = async () => {
+    if (!btn || btn.disabled) return;
     btn.disabled = true;
     btn.textContent = "Starting session...";
     try {
-      await onCreateSession();
+      const optionalKey = aiKeyInput?.value.trim() || undefined;
+      await onCreateSession(optionalKey);
     } catch (err) {
       console.error("Failed to create session:", err);
       btn.disabled = false;
       btn.textContent = "Start session";
+    }
+  };
+
+  btn?.addEventListener("click", () => {
+    void triggerCreate();
+  });
+
+  aiKeyInput?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void triggerCreate();
     }
   });
 }
@@ -139,19 +168,51 @@ export function renderMissingKeyView(
     });
 }
 
+function escapeHtml(raw: string): string {
+  return raw
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatChatMessageHtml(content: string): string {
+  const parts = content.split(/```([\s\S]*?)```/g);
+  return parts
+    .map((part, idx) => {
+      if (idx % 2 === 1) {
+        const cleaned = part.replace(/^[a-zA-Z0-9_-]+\n/, "");
+        return `<pre class="my-2 p-2.5 rounded-md bg-zinc-950 border border-zinc-800 font-mono text-xs text-emerald-300 overflow-x-auto whitespace-pre"><code>${escapeHtml(
+          cleaned
+        )}</code></pre>`;
+      }
+      return `<span class="whitespace-pre-wrap">${escapeHtml(part)}</span>`;
+    })
+    .join("");
+}
+
+export interface RoomAiState {
+  enabled: boolean;
+  provider?: AIProvider;
+  thinking?: boolean;
+  messages: ChatMessage[];
+}
+
 export interface RoomShellController {
   editorContainer: HTMLElement;
   setConnectionStatus: (status: ConnectionStatus) => void;
   setExpiresAt: (expiresAtMs: number) => void;
   setSelectedLanguage: (lang: SupportedLanguage) => void;
+  setAiState: (state: RoomAiState) => void;
   showExpiredBanner: () => void;
   destroy: () => void;
 }
 
 /**
  * Renders the Room Workspace UI with persistent header (Logo, Language selector,
- * 24h Countdown Timer, Connection Indicator, and "Copy Encrypted Link" button)
- * and full-viewport CodeMirror container.
+ * 24h Countdown Timer, Connection Indicator, optional AI Chat toggle, and "Copy link" button),
+ * full-viewport CodeMirror container, and optional AI Coding Assistant side panel.
  */
 export function renderRoomShell(
   root: HTMLElement,
@@ -160,10 +221,13 @@ export function renderRoomShell(
     initialLanguage: SupportedLanguage;
     initialLinkCopied?: boolean;
     onLanguageSelect: (lang: SupportedLanguage) => void;
+    onSendAiPrompt?: (prompt: string) => void;
     onLogoClick: () => void;
   }
 ): RoomShellController {
   let expiresAtMs = Date.now() + TWENTY_FOUR_HOURS_MS;
+  let aiHasAutoOpened = false;
+  let aiPanelOpen = false;
 
   const languageOptionsHtml = LANGUAGE_OPTIONS.map(
     (opt) =>
@@ -212,8 +276,8 @@ export function renderRoomShell(
           </div>
         </div>
 
-        <!-- Right: Connection Status Indicator & Copy Encrypted Link Button -->
-        <div class="flex items-center gap-3">
+        <!-- Right: Connection Status Indicator, AI Chat Toggle & Copy Link Button -->
+        <div class="flex items-center gap-2.5">
           <div
             id="connection-badge"
             class="inline-flex items-center gap-2 px-2.5 py-1 rounded-md bg-zinc-950/90 border border-zinc-800 text-xs font-mono text-amber-300"
@@ -221,6 +285,15 @@ export function renderRoomShell(
             <span id="connection-dot" class="h-2 w-2 rounded-full bg-amber-400 animate-pulse"></span>
             <span id="connection-label">Reconnecting</span>
           </div>
+
+          <button
+            id="toggle-ai-btn"
+            type="button"
+            class="hidden cursor-pointer items-center gap-1.5 px-3 py-1.5 rounded-md bg-zinc-950 border border-zinc-800 hover:border-emerald-500/50 text-zinc-200 text-xs font-mono transition"
+          >
+            <span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>
+            <span>AI Chat</span>
+          </button>
 
           <button
             id="copy-link-btn"
@@ -243,8 +316,72 @@ export function renderRoomShell(
         This 24-hour disposable session has expired and been purged from storage.
       </div>
 
-      <!-- Main Full-Viewport CodeMirror 6 Container -->
-      <main id="editor-viewport" class="flex-1 w-full h-full overflow-hidden relative bg-zinc-950"></main>
+      <!-- Main Workspace Row: Editor + Optional AI Side Panel -->
+      <div class="flex-1 w-full h-full flex overflow-hidden relative bg-zinc-950">
+        <main id="editor-viewport" class="flex-1 min-w-0 h-full overflow-hidden relative bg-zinc-950"></main>
+
+        <!-- AI Coding Assistant Side Panel (shown only when session started with AI key) -->
+        <aside
+          id="ai-side-panel"
+          class="hidden w-88 sm:w-96 shrink-0 h-full border-l border-zinc-800 bg-zinc-900/95 flex-col overflow-hidden"
+        >
+          <div class="px-3.5 py-2.5 border-b border-zinc-800 flex items-center justify-between gap-2">
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="text-xs font-semibold text-zinc-100">AI Assistant</span>
+              <span
+                id="ai-provider-badge"
+                class="px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/30 text-[10px] font-mono text-emerald-400"
+              >
+                OpenAI
+              </span>
+              <span class="px-1.5 py-0.5 rounded bg-zinc-800 text-[10px] font-mono text-zinc-400">
+                Coding Only
+              </span>
+            </div>
+            <button
+              id="close-ai-panel-btn"
+              type="button"
+              title="Hide AI Panel"
+              class="cursor-pointer text-zinc-400 hover:text-zinc-200 text-xs font-mono px-1.5 py-0.5 rounded hover:bg-zinc-800 transition"
+            >
+              ✕
+            </button>
+          </div>
+
+          <div
+            id="ai-messages-list"
+            class="flex-1 overflow-y-auto p-3.5 space-y-3 text-xs leading-relaxed"
+          >
+            <div class="text-zinc-500 font-mono text-[11px] text-center py-6">
+              Ask coding, debugging, or algorithm questions about the current editor buffer.
+            </div>
+          </div>
+
+          <div
+            id="ai-thinking-indicator"
+            class="hidden px-3.5 py-1.5 border-t border-zinc-800/80 bg-zinc-950/60 text-[11px] font-mono text-emerald-400 flex items-center gap-2"
+          >
+            <span class="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+            <span>Thinking...</span>
+          </div>
+
+          <form id="ai-prompt-form" class="p-3 border-t border-zinc-800 bg-zinc-950/80 flex gap-2">
+            <textarea
+              id="ai-prompt-input"
+              rows="2"
+              placeholder="Ask a coding question... (Enter to send)"
+              class="flex-1 resize-none rounded-md bg-zinc-900 border border-zinc-800 focus:border-emerald-500 focus:outline-none px-2.5 py-1.5 text-xs text-zinc-100 placeholder-zinc-500"
+            ></textarea>
+            <button
+              id="ai-send-btn"
+              type="submit"
+              class="cursor-pointer self-end px-3 py-1.5 rounded-md bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold text-xs transition"
+            >
+              Send
+            </button>
+          </form>
+        </aside>
+      </div>
     </div>
   `;
 
@@ -258,6 +395,56 @@ export function renderRoomShell(
   const languageSelect = root.querySelector<HTMLSelectElement>("#language-select")!;
   const brandHomeBtn = root.querySelector<HTMLButtonElement>("#brand-home-btn")!;
   const expiredBanner = root.querySelector<HTMLElement>("#expired-banner")!;
+
+  const toggleAiBtn = root.querySelector<HTMLButtonElement>("#toggle-ai-btn")!;
+  const aiSidePanel = root.querySelector<HTMLElement>("#ai-side-panel")!;
+  const closeAiPanelBtn = root.querySelector<HTMLButtonElement>("#close-ai-panel-btn")!;
+  const aiProviderBadge = root.querySelector<HTMLElement>("#ai-provider-badge")!;
+  const aiMessagesList = root.querySelector<HTMLElement>("#ai-messages-list")!;
+  const aiThinkingIndicator = root.querySelector<HTMLElement>("#ai-thinking-indicator")!;
+  const aiPromptForm = root.querySelector<HTMLFormElement>("#ai-prompt-form")!;
+  const aiPromptInput = root.querySelector<HTMLTextAreaElement>("#ai-prompt-input")!;
+
+  const syncAiPanelVisibility = () => {
+    if (aiPanelOpen) {
+      aiSidePanel.classList.remove("hidden");
+      aiSidePanel.classList.add("flex");
+      toggleAiBtn.classList.add("border-emerald-500/60", "text-emerald-300");
+    } else {
+      aiSidePanel.classList.add("hidden");
+      aiSidePanel.classList.remove("flex");
+      toggleAiBtn.classList.remove("border-emerald-500/60", "text-emerald-300");
+    }
+  };
+
+  toggleAiBtn.addEventListener("click", () => {
+    aiPanelOpen = !aiPanelOpen;
+    syncAiPanelVisibility();
+  });
+
+  closeAiPanelBtn.addEventListener("click", () => {
+    aiPanelOpen = false;
+    syncAiPanelVisibility();
+  });
+
+  const submitAiPrompt = () => {
+    const prompt = aiPromptInput.value.trim();
+    if (!prompt) return;
+    aiPromptInput.value = "";
+    options.onSendAiPrompt?.(prompt);
+  };
+
+  aiPromptForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    submitAiPrompt();
+  });
+
+  aiPromptInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      submitAiPrompt();
+    }
+  });
 
   const updateCountdownDisplay = () => {
     countdownText.textContent = formatCountdown(expiresAtMs);
@@ -313,6 +500,66 @@ export function renderRoomShell(
     setSelectedLanguage(lang: SupportedLanguage) {
       if (languageSelect.value !== lang) {
         languageSelect.value = lang;
+      }
+    },
+    setAiState(state: RoomAiState) {
+      if (!state.enabled) {
+        toggleAiBtn.classList.add("hidden");
+        toggleAiBtn.classList.remove("inline-flex");
+        aiPanelOpen = false;
+        syncAiPanelVisibility();
+        return;
+      }
+
+      toggleAiBtn.classList.remove("hidden");
+      toggleAiBtn.classList.add("inline-flex");
+
+      if (!aiHasAutoOpened) {
+        aiHasAutoOpened = true;
+        aiPanelOpen = true;
+        syncAiPanelVisibility();
+      }
+
+      if (state.provider) {
+        aiProviderBadge.textContent = getProviderLabel(state.provider);
+      }
+
+      if (state.thinking) {
+        aiThinkingIndicator.classList.remove("hidden");
+      } else {
+        aiThinkingIndicator.classList.add("hidden");
+      }
+
+      if (state.messages.length === 0) {
+        aiMessagesList.innerHTML = `
+          <div class="text-zinc-500 font-mono text-[11px] text-center py-6">
+            Ask coding, debugging, or algorithm questions about the current editor buffer.
+          </div>
+        `;
+      } else {
+        aiMessagesList.innerHTML = state.messages
+          .map((m) => {
+            const isUser = m.role === "user";
+            const isError = m.status === "error";
+            const bubbleClass = isUser
+              ? "bg-emerald-500/15 border-emerald-500/30 text-zinc-100 ml-6"
+              : isError
+              ? "bg-red-950/50 border-red-800/70 text-red-200 mr-4"
+              : "bg-zinc-950 border-zinc-800 text-zinc-200 mr-4";
+            const roleLabel = isUser
+              ? "You / Room"
+              : m.provider
+              ? getProviderLabel(m.provider)
+              : "AI";
+            return `
+              <div class="p-2.5 rounded-lg border ${bubbleClass}">
+                <div class="text-[10px] font-mono text-zinc-400 mb-1">${escapeHtml(roleLabel)}</div>
+                <div class="text-xs leading-relaxed break-words">${formatChatMessageHtml(m.content)}</div>
+              </div>
+            `;
+          })
+          .join("");
+        aiMessagesList.scrollTop = aiMessagesList.scrollHeight;
       }
     },
     showExpiredBanner() {

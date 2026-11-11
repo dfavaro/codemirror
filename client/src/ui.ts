@@ -3,6 +3,7 @@ import {
   AIProvider,
   AIProviderSelection,
   ChatMessage,
+  detectProviderFromKey,
   getProviderLabel
 } from "./ai";
 import { LANGUAGE_OPTIONS, SupportedLanguage } from "./editor";
@@ -123,6 +124,30 @@ export function renderLandingView(
   const btn = root.querySelector<HTMLButtonElement>("#new-session-btn");
   const aiKeyInput = root.querySelector<HTMLInputElement>("#ai-key-input");
   const aiProviderSelect = root.querySelector<HTMLSelectElement>("#ai-provider-select");
+
+  let userManuallySelectedProvider = false;
+
+  aiProviderSelect?.addEventListener("change", () => {
+    userManuallySelectedProvider = aiProviderSelect.value !== "auto";
+  });
+
+  const syncDetectedProvider = () => {
+    if (!aiKeyInput || !aiProviderSelect) return;
+    const rawKey = aiKeyInput.value.trim();
+    if (!rawKey) {
+      userManuallySelectedProvider = false;
+      aiProviderSelect.value = "auto";
+      return;
+    }
+    if (!userManuallySelectedProvider || aiProviderSelect.value === "auto") {
+      aiProviderSelect.value = detectProviderFromKey(rawKey);
+    }
+  };
+
+  aiKeyInput?.addEventListener("input", syncDetectedProvider);
+  aiKeyInput?.addEventListener("paste", () => {
+    setTimeout(syncDetectedProvider, 0);
+  });
 
   const triggerCreate = async () => {
     if (!btn || btn.disabled) return;

@@ -51,6 +51,17 @@ export const CODING_ONLY_SYSTEM_PROMPT = [
 const MAX_CODE_CONTEXT_CHARS = 24_000;
 
 /**
+ * Normalizes an API key by trimming whitespace, quotes, and accidental "Bearer " prefixes.
+ */
+export function sanitizeApiKey(rawKey: string): string {
+  return rawKey
+    .trim()
+    .replace(/^["']+|["']+$/g, "")
+    .replace(/^Bearer\s+/i, "")
+    .trim();
+}
+
+/**
  * Auto-detects the AI provider from the API key prefix.
  * - `oc_sk_...` -> OpenCode (opencode.ai)
  * - `sk-ant-...` -> Anthropic Claude
@@ -61,8 +72,8 @@ const MAX_CODE_CONTEXT_CHARS = 24_000;
  * - `sk-...` (or fallback) -> OpenAI
  */
 export function detectProviderFromKey(apiKey: string): AIProvider {
-  const trimmed = apiKey.trim();
-  if (trimmed.startsWith("oc_sk_")) {
+  const trimmed = sanitizeApiKey(apiKey);
+  if (trimmed.startsWith("oc_sk_") || trimmed.startsWith("opencode_")) {
     return "opencode";
   }
   if (trimmed.startsWith("sk-ant-")) {
@@ -202,6 +213,13 @@ const OPENAI_COMPATIBLE_SPECS: Record<
   }
 };
 
+function getSafeFetch(customFetch?: typeof fetch): typeof fetch {
+  if (customFetch) {
+    return (input: RequestInfo | URL, init?: RequestInit) => customFetch(input, init);
+  }
+  return (input: RequestInfo | URL, init?: RequestInit) => globalThis.fetch(input, init);
+}
+
 async function executeProviderRequest(
   targetUrl: string,
   headers: Record<string, string>,
@@ -213,10 +231,11 @@ async function executeProviderRequest(
     proxyUrl?: string;
   }
 ): Promise<Response> {
+  const { fetchFn } = options;
   const effectiveProxyUrl = options.proxyUrl || resolveRelayHttpUrl("/api/ai-proxy");
 
   const sendViaProxy = () =>
-    options.fetchFn(effectiveProxyUrl, {
+    fetchFn(effectiveProxyUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
@@ -233,7 +252,7 @@ async function executeProviderRequest(
   }
 
   try {
-    return await options.fetchFn(targetUrl, {
+    return await fetchFn(targetUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -256,13 +275,13 @@ async function executeProviderRequest(
 export async function sendCodingChatCompletion(
   options: SendCodingChatOptions
 ): Promise<string> {
-  const apiKey = options.apiKey.trim();
+  const apiKey = sanitizeApiKey(options.apiKey);
   if (!apiKey) {
     throw new Error("Missing AI API key.");
   }
 
   const provider = resolveProvider(apiKey, options.provider);
-  const fetchFn = options.fetchImpl ?? globalThis.fetch;
+  const fetchFn = getSafeFetch(options.fetchImpl);
   const customFetchInjected = Boolean(options.fetchImpl);
   const systemPrompt = buildSystemPromptWithContext(
     options.language,
@@ -404,11 +423,7 @@ export async function sendCodingChatCompletion(
 
   let response = await callOpenAICompatible(provider);
 
-  if (
-    !response.ok &&
-    provider === "opencode" &&
-    (!options.provider || options.provider === "auto")
-  ) {
+  if (!response.ok && provider === "opencode") {
     const goFallbackResponse = await callOpenAICompatible("opencode-go").catch(() => null);
     if (goFallbackResponse && goFallbackResponse.ok) {
       response = goFallbackResponse;

@@ -17,6 +17,7 @@ import {
   CODING_ONLY_SYSTEM_PROMPT,
   detectProviderFromKey,
   resolveProvider,
+  sanitizeApiKey,
   sendCodingChatCompletion
 } from "../ai";
 import {
@@ -439,14 +440,52 @@ describe("Session Countdown Formatter & Supported Languages", () => {
 
   it("auto-detects BYOK AI providers, enforces coding-only system prompt with live editor context, and executes host-proxied room chat over Yjs", async () => {
     expect(detectProviderFromKey("oc_sk_testOpenCodeKey")).toBe("opencode");
+    expect(detectProviderFromKey("opencode_testKey")).toBe("opencode");
     expect(detectProviderFromKey("sk-ant-api03-test")).toBe("anthropic");
     expect(detectProviderFromKey("AIzaSyTestGeminiKey")).toBe("gemini");
+    expect(detectProviderFromKey("  'AIzaSyQuotedGeminiKey'  ")).toBe("gemini");
+    expect(detectProviderFromKey("Bearer sk-ant-api03-bearer")).toBe("anthropic");
+    expect(sanitizeApiKey("  \"Bearer AIzaSyKey123\"  ")).toBe("AIzaSyKey123");
     expect(detectProviderFromKey("sk-or-v1-testOpenRouter")).toBe("openrouter");
     expect(detectProviderFromKey("gsk_testGroqKey")).toBe("groq");
     expect(detectProviderFromKey("xai-testGrokKey")).toBe("xai");
     expect(detectProviderFromKey("sk-proj-testOpenAiKey")).toBe("openai");
     expect(resolveProvider("oc_sk_testOpenCodeKey", "opencode-go")).toBe("opencode-go");
     expect(resolveProvider("sk-custom", "deepseek")).toBe("deepseek");
+
+    // Simulate strict browser Window.prototype.fetch that throws Illegal invocation if `this` is bound to an options object
+    const strictWindowFetch = async function (this: unknown, input: RequestInfo | URL) {
+      if (this !== undefined && this !== globalThis) {
+        throw new TypeError("'fetch' called on an object that does not implement interface Window.");
+      }
+      const urlStr = String(input);
+      if (urlStr.includes("generativelanguage.googleapis.com")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [{ content: { parts: [{ text: "Gemini response OK." }] } }]
+          })
+        } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [{ message: { content: "Default response OK." } }]
+        })
+      } as Response;
+    } as typeof fetch;
+
+    const geminiReply = await sendCodingChatCompletion({
+      apiKey: "AIzaSyGeminiKey",
+      provider: "auto",
+      messages: [{ id: "g1", role: "user", content: "Write binary search", createdAt: 1 }],
+      codeContext: "",
+      language: "kotlin",
+      fetchImpl: strictWindowFetch
+    });
+    expect(geminiReply).toBe("Gemini response OK.");
 
     const prompt = buildSystemPromptWithContext("kotlin", "val state = MutableStateFlow(0)");
     expect(prompt).toContain(CODING_ONLY_SYSTEM_PROMPT);

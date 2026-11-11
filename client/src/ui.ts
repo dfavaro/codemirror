@@ -1,4 +1,10 @@
-import { AIProvider, ChatMessage, getProviderLabel } from "./ai";
+import {
+  AI_PROVIDER_OPTIONS,
+  AIProvider,
+  AIProviderSelection,
+  ChatMessage,
+  getProviderLabel
+} from "./ai";
 import { LANGUAGE_OPTIONS, SupportedLanguage } from "./editor";
 import { ConnectionStatus } from "./provider";
 
@@ -53,12 +59,16 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
 
 /**
  * Renders the minimal centered Homepage with Logo, 1-line description,
- * optional AI API key input, and "Start session" CTA (FR-1).
+ * optional AI provider + API key input, and "Start session" CTA (FR-1).
  */
 export function renderLandingView(
   root: HTMLElement,
-  onCreateSession: (aiApiKey?: string) => Promise<void>
+  onCreateSession: (aiApiKey?: string, aiProvider?: AIProviderSelection) => Promise<void>
 ): void {
+  const providerOptionsHtml = AI_PROVIDER_OPTIONS.map(
+    (opt) => `<option value="${opt.id}">${opt.label}</option>`
+  ).join("");
+
   root.innerHTML = `
     <main class="min-h-screen w-full bg-zinc-950 text-zinc-100 flex items-center justify-center px-6">
       <div class="max-w-md w-full text-center space-y-6">
@@ -74,15 +84,24 @@ export function renderLandingView(
         </p>
 
         <div class="pt-1 space-y-3 max-w-sm mx-auto">
-          <div>
+          <div class="flex gap-2">
+            <label for="ai-provider-select" class="sr-only">AI Provider</label>
+            <select
+              id="ai-provider-select"
+              title="AI Provider"
+              class="w-36 shrink-0 px-2.5 py-2.5 rounded-lg bg-zinc-900 border border-zinc-800 focus:border-emerald-500 focus:outline-none text-xs font-mono text-zinc-200 transition cursor-pointer"
+            >
+              ${providerOptionsHtml}
+            </select>
+
             <label for="ai-key-input" class="sr-only">Optional AI API Key</label>
             <input
               id="ai-key-input"
               type="password"
               autocomplete="off"
               spellcheck="false"
-              placeholder="Optional: AI API key (OpenAI, Claude, or Gemini)"
-              class="w-full px-3.5 py-2.5 rounded-lg bg-zinc-900 border border-zinc-800 focus:border-emerald-500 focus:outline-none text-xs sm:text-sm font-mono text-zinc-200 placeholder-zinc-500 transition"
+              placeholder="Optional: AI API key"
+              class="flex-1 min-w-0 px-3 py-2.5 rounded-lg bg-zinc-900 border border-zinc-800 focus:border-emerald-500 focus:outline-none text-xs sm:text-sm font-mono text-zinc-200 placeholder-zinc-500 transition"
             />
           </div>
 
@@ -103,6 +122,7 @@ export function renderLandingView(
 
   const btn = root.querySelector<HTMLButtonElement>("#new-session-btn");
   const aiKeyInput = root.querySelector<HTMLInputElement>("#ai-key-input");
+  const aiProviderSelect = root.querySelector<HTMLSelectElement>("#ai-provider-select");
 
   const triggerCreate = async () => {
     if (!btn || btn.disabled) return;
@@ -110,7 +130,9 @@ export function renderLandingView(
     btn.textContent = "Starting session...";
     try {
       const optionalKey = aiKeyInput?.value.trim() || undefined;
-      await onCreateSession(optionalKey);
+      const selectedProvider =
+        (aiProviderSelect?.value as AIProviderSelection | undefined) || "auto";
+      await onCreateSession(optionalKey, selectedProvider);
     } catch (err) {
       console.error("Failed to create session:", err);
       btn.disabled = false;
@@ -222,6 +244,7 @@ export function renderRoomShell(
     initialLinkCopied?: boolean;
     onLanguageSelect: (lang: SupportedLanguage) => void;
     onSendAiPrompt?: (prompt: string) => void;
+    onEndSession?: () => void;
     onLogoClick: () => void;
   }
 ): RoomShellController {
@@ -304,6 +327,14 @@ export function renderRoomShell(
               <path stroke-linecap="round" stroke-linejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
             </svg>
             <span id="copy-link-label">Copy link</span>
+          </button>
+
+          <button
+            id="end-session-btn"
+            type="button"
+            class="cursor-pointer inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-red-900/60 bg-red-950/30 hover:bg-red-950/70 text-red-300 font-medium text-xs tracking-tight transition"
+          >
+            <span id="end-session-label">End session</span>
           </button>
         </div>
       </header>
@@ -392,6 +423,8 @@ export function renderRoomShell(
   const connectionLabel = root.querySelector<HTMLElement>("#connection-label")!;
   const copyLinkBtn = root.querySelector<HTMLButtonElement>("#copy-link-btn")!;
   const copyLinkLabel = root.querySelector<HTMLElement>("#copy-link-label")!;
+  const endSessionBtn = root.querySelector<HTMLButtonElement>("#end-session-btn")!;
+  const endSessionLabel = root.querySelector<HTMLElement>("#end-session-label")!;
   const languageSelect = root.querySelector<HTMLSelectElement>("#language-select")!;
   const brandHomeBtn = root.querySelector<HTMLButtonElement>("#brand-home-btn")!;
   const expiredBanner = root.querySelector<HTMLElement>("#expired-banner")!;
@@ -476,6 +509,31 @@ export function renderRoomShell(
   copyLinkBtn.addEventListener("click", async () => {
     await copyTextToClipboard(window.location.href);
     showCopiedFeedback("Copied!");
+  });
+
+  let confirmingEnd = false;
+  let endConfirmTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  const resetEndSessionBtn = () => {
+    confirmingEnd = false;
+    endSessionLabel.textContent = "End session";
+    endSessionBtn.className =
+      "cursor-pointer inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-red-900/60 bg-red-950/30 hover:bg-red-950/70 text-red-300 font-medium text-xs tracking-tight transition";
+  };
+
+  endSessionBtn.addEventListener("click", () => {
+    if (!confirmingEnd) {
+      confirmingEnd = true;
+      endSessionLabel.textContent = "Confirm?";
+      endSessionBtn.className =
+        "cursor-pointer inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-red-500 bg-red-600 hover:bg-red-500 text-white font-semibold text-xs tracking-tight transition";
+      if (endConfirmTimeout) clearTimeout(endConfirmTimeout);
+      endConfirmTimeout = setTimeout(resetEndSessionBtn, 3000);
+      return;
+    }
+
+    if (endConfirmTimeout) clearTimeout(endConfirmTimeout);
+    options.onEndSession?.();
   });
 
   return {
@@ -569,6 +627,7 @@ export function renderRoomShell(
     destroy() {
       clearInterval(timerInterval);
       if (copyTimeout) clearTimeout(copyTimeout);
+      if (endConfirmTimeout) clearTimeout(endConfirmTimeout);
     }
   };
 }

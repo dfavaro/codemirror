@@ -2,9 +2,12 @@ import "./style.css";
 import * as Y from "yjs";
 import {
   AIProvider,
+  AIProviderSelection,
   attachHostAiResponder,
   ChatMessage,
+  clearHostRoomAiKey,
   loadHostRoomAiKey,
+  loadHostRoomAiProvider,
   saveHostRoomAiKey
 } from "./ai";
 import { createSession, importKeyFromHash } from "./crypto";
@@ -49,10 +52,13 @@ function parseRoomIdFromPath(pathname: string): string | null {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
-async function startNewSession(aiApiKey?: string): Promise<void> {
+async function startNewSession(
+  aiApiKey?: string,
+  aiProvider: AIProviderSelection = "auto"
+): Promise<void> {
   const { roomId, hashKey } = await createSession();
   if (aiApiKey && aiApiKey.trim().length > 0) {
-    saveHostRoomAiKey(roomId, aiApiKey);
+    saveHostRoomAiKey(roomId, aiApiKey, aiProvider);
   }
   const targetUrl = `/room/${encodeURIComponent(roomId)}#${hashKey}`;
   window.history.pushState({}, "", targetUrl);
@@ -79,6 +85,13 @@ async function mountRoomSession(roomId: string, hashFragment: string): Promise<v
   const initialLinkCopied = pendingInitialCopyFeedback;
   pendingInitialCopyFeedback = false;
 
+  const navigateHomeAfterEnd = () => {
+    clearHostRoomAiKey(roomId);
+    cleanupActiveRoom();
+    window.history.pushState({}, "", "/");
+    void routeApplication();
+  };
+
   const shell = renderRoomShell(appRoot, {
     roomId,
     initialLanguage: "kotlin",
@@ -95,6 +108,10 @@ async function mountRoomSession(roomId: string, hashFragment: string): Promise<v
           createdAt: Date.now()
         }
       ]);
+    },
+    onEndSession: () => {
+      activeProvider?.destroyRoom();
+      navigateHomeAfterEnd();
     },
     onLogoClick: () => {
       cleanupActiveRoom();
@@ -120,8 +137,12 @@ async function mountRoomSession(roomId: string, hashFragment: string): Promise<v
   ychat.observe(syncAiShellState);
 
   const hostAiKey = loadHostRoomAiKey(roomId);
+  const hostAiProvider = loadHostRoomAiProvider(roomId);
   if (hostAiKey) {
-    detachAiResponder = attachHostAiResponder(doc, hostAiKey);
+    detachAiResponder = attachHostAiResponder(doc, hostAiKey, undefined, {
+      provider: hostAiProvider,
+      roomId
+    });
   }
   syncAiShellState();
 
@@ -139,6 +160,9 @@ async function mountRoomSession(roomId: string, hashFragment: string): Promise<v
     },
     onSessionExpired: () => {
       shell.showExpiredBanner();
+    },
+    onSessionEnded: () => {
+      navigateHomeAfterEnd();
     }
   });
 

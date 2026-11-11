@@ -1,5 +1,6 @@
 export const FRAME_TYPE_DELTA = 0x01;
 export const FRAME_TYPE_SNAPSHOT = 0x02;
+export const FRAME_TYPE_DESTROY = 0x03;
 export const IV_BYTE_LENGTH = 12;
 
 function getCrypto(): Crypto {

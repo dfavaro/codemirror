@@ -3,6 +3,7 @@ import {
   decryptDelta,
   encryptDelta,
   FRAME_TYPE_DELTA,
+  FRAME_TYPE_DESTROY,
   FRAME_TYPE_SNAPSHOT,
   unwrapEncryptedFrame,
   wrapEncryptedFrame
@@ -23,6 +24,7 @@ export interface EncryptedWsProviderOptions {
   onStatusChange?: (status: ConnectionStatus) => void;
   onMetadata?: (meta: RoomMetadata) => void;
   onSessionExpired?: () => void;
+  onSessionEnded?: () => void;
   onDecryptionError?: (err: unknown) => void;
 }
 
@@ -54,6 +56,33 @@ export function resolveRelayWsUrl(roomId: string, customBaseUrl?: string): strin
 }
 
 /**
+ * Resolves an HTTP endpoint on the relay server (such as `/api/ai-proxy`)
+ * from VITE_WS_RELAY_URL or current origin.
+ */
+export function resolveRelayHttpUrl(path: string, customBaseUrl?: string): string {
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const base =
+    customBaseUrl ||
+    (typeof import.meta !== "undefined" && (import.meta as { env?: Record<string, string> }).env?.VITE_WS_RELAY_URL) ||
+    "";
+
+  if (base) {
+    const httpBase = base
+      .replace(/^wss:/i, "https:")
+      .replace(/^ws:/i, "http:")
+      .replace(/\/ws\/?$/i, "")
+      .replace(/\/+$/, "");
+    return `${httpBase}${normalizedPath}`;
+  }
+
+  if (typeof window !== "undefined") {
+    return `${window.location.origin}${normalizedPath}`;
+  }
+
+  return `http://localhost:8080${normalizedPath}`;
+}
+
+/**
  * Zero-Knowledge WebSocket Provider for Yjs.
  * Encrypts all outgoing Y.Doc updates with AES-GCM-256 and decrypts incoming binary frames.
  */
@@ -67,6 +96,7 @@ export class EncryptedWsProvider {
   private readonly onStatusChange?: (status: ConnectionStatus) => void;
   private readonly onMetadata?: (meta: RoomMetadata) => void;
   private readonly onSessionExpired?: () => void;
+  private readonly onSessionEnded?: () => void;
   private readonly onDecryptionError?: (err: unknown) => void;
 
   private ws: WebSocket | null = null;
@@ -117,6 +147,7 @@ export class EncryptedWsProvider {
     this.onStatusChange = options.onStatusChange;
     this.onMetadata = options.onMetadata;
     this.onSessionExpired = options.onSessionExpired;
+    this.onSessionEnded = options.onSessionEnded;
     this.onDecryptionError = options.onDecryptionError;
 
     this.doc.on("update", this.handleDocUpdate);
@@ -192,6 +223,11 @@ export class EncryptedWsProvider {
           this.destroy();
           return;
         }
+        if (event.code === 4005) {
+          this.onSessionEnded?.();
+          this.destroy();
+          return;
+        }
         this.setStatus("reconnecting");
         this.scheduleReconnect();
       };
@@ -214,6 +250,9 @@ export class EncryptedWsProvider {
           createdAt: parsed.createdAt || parsed.expiresAt - 24 * 60 * 60 * 1000,
           expiresAt: parsed.expiresAt
         });
+      } else if (parsed?.type === "room_destroyed") {
+        this.onSessionEnded?.();
+        this.destroy();
       }
     } catch {
       // Ignore unrecognized non-binary messages
@@ -287,6 +326,21 @@ export class EncryptedWsProvider {
       this.reconnectTimer = null;
       this.connect();
     }, delay);
+  }
+
+  /**
+   * Sends FRAME_TYPE_DESTROY (0x03) to permanently delete the room on the relay
+   * and Cloud Firestore, disconnecting all connected peers, then closes locally.
+   */
+  public destroyRoom(): void {
+    if (this.ws && this.ws.readyState === this.WebSocketImpl.OPEN) {
+      try {
+        this.ws.send(new Uint8Array([FRAME_TYPE_DESTROY]));
+      } catch {
+        // Ignore send error before destroy
+      }
+    }
+    this.destroy();
   }
 
   public destroy(): void {

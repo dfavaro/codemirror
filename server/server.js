@@ -3,9 +3,23 @@ const http = require("http");
 
 const FRAME_TYPE_DELTA = 0x01;
 const FRAME_TYPE_SNAPSHOT = 0x02;
+const FRAME_TYPE_DESTROY = 0x03;
 const ROOM_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const MAX_PEERS_PER_ROOM = 100;
 const MAX_PENDING_DELTAS = 500;
+const MAX_PROXY_BODY_BYTES = 256 * 1024;
+
+const ALLOWED_AI_HOSTS = new Set([
+  "opencode.ai",
+  "api.openai.com",
+  "api.anthropic.com",
+  "generativelanguage.googleapis.com",
+  "openrouter.ai",
+  "api.groq.com",
+  "api.deepseek.com",
+  "api.x.ai",
+  "api.mistral.ai"
+]);
 
 /**
  * Creates a storage adapter backed by Google Cloud Firestore when available,
@@ -25,6 +39,9 @@ function createRoomStore(options = {}) {
         const merged = { ...existing, ...data };
         memoryDocs.set(roomId, merged);
         return merged;
+      },
+      async deleteRoom(roomId) {
+        memoryDocs.delete(roomId);
       }
     };
   }
@@ -100,6 +117,18 @@ function createRoomStore(options = {}) {
         useFallback = true;
       }
       return record;
+    },
+    async deleteRoom(roomId) {
+      memoryDocs.delete(roomId);
+      if (useFallback) {
+        return;
+      }
+      try {
+        await firestore.collection("rooms").doc(roomId).delete();
+      } catch (err) {
+        console.warn("Firestore delete failed:", err.message);
+        useFallback = true;
+      }
     }
   };
 }
@@ -109,6 +138,7 @@ function createRoomStore(options = {}) {
  */
 function createRelayServer(options = {}) {
   const store = options.store || createRoomStore(options);
+  const fetchFn = options.fetchImpl || globalThis.fetch;
 
   // Map<roomId, { clients: Set<WebSocket>, createdAt: number, expiresAt: number, snapshot: Buffer | null, pendingDeltas: Buffer[], initPromise: Promise<void> | null }>
   const rooms = new Map();
@@ -129,6 +159,24 @@ function createRelayServer(options = {}) {
       );
       return;
     }
+
+    if (req.url === "/api/ai-proxy") {
+      if (req.method === "OPTIONS") {
+        res.writeHead(204, {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type"
+        });
+        res.end();
+        return;
+      }
+
+      if (req.method === "POST") {
+        handleAiProxyRequest(req, res, fetchFn);
+        return;
+      }
+    }
+
     res.writeHead(404);
     res.end("Not Found");
   });
@@ -207,8 +255,22 @@ function createRelayServer(options = {}) {
     room.clients.add(ws);
 
     ws.on("message", (data, isBinary) => {
-      if (!isBinary) return;
+      if (!isBinary) {
+        try {
+          const parsed = JSON.parse(data.toString());
+          if (parsed && parsed.type === "destroy_room") {
+            void destroyRoomSession(roomId, room);
+          }
+        } catch {
+          // Ignore malformed text message
+        }
+        return;
+      }
       const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      if (buf.length === 1 && buf[0] === FRAME_TYPE_DESTROY) {
+        void destroyRoomSession(roomId, room);
+        return;
+      }
       if (buf.length < 13) return; // Minimum: 12-byte IV + at least 1 byte payload
 
       if (!isReady) {
@@ -259,6 +321,11 @@ function createRelayServer(options = {}) {
 
   function handleClientFrame(senderWs, roomId, room, buf) {
     const firstByte = buf[0];
+
+    if (firstByte === FRAME_TYPE_DESTROY) {
+      void destroyRoomSession(roomId, room);
+      return;
+    }
 
     if (firstByte === FRAME_TYPE_SNAPSHOT) {
       // Encrypted full-document snapshot: [0x02][12-byte IV][Ciphertext + Auth Tag]
@@ -314,7 +381,128 @@ function createRelayServer(options = {}) {
     }
   }
 
+  async function destroyRoomSession(roomId, room) {
+    room.snapshot = null;
+    room.pendingDeltas = [];
+    rooms.delete(roomId);
+
+    try {
+      await store.deleteRoom(roomId);
+    } catch (err) {
+      console.error(`Failed to delete room ${roomId}:`, err);
+    }
+
+    const peers = Array.from(room.clients);
+    room.clients.clear();
+
+    for (const peer of peers) {
+      try {
+        if (peer.readyState === WebSocket.OPEN) {
+          peer.send(JSON.stringify({ type: "room_destroyed", roomId }));
+        }
+        peer.close(4005, "Room session ended");
+      } catch {
+        // Ignore close errors
+      }
+    }
+  }
+
   return { server, wss, rooms, store };
+}
+
+/**
+ * Stateless, zero-logging CORS pass-through for AI providers (such as opencode.ai)
+ * that reject browser OPTIONS preflights or require custom User-Agent / session headers.
+ */
+function handleAiProxyRequest(req, res, fetchFn) {
+  let rawBody = "";
+  let bodyBytes = 0;
+  let aborted = false;
+
+  req.on("data", (chunk) => {
+    if (aborted) return;
+    bodyBytes += chunk.length;
+    if (bodyBytes > MAX_PROXY_BODY_BYTES) {
+      aborted = true;
+      res.writeHead(413, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      });
+      res.end(JSON.stringify({ error: { message: "Proxy payload too large" } }));
+      req.destroy();
+      return;
+    }
+    rawBody += chunk.toString("utf8");
+  });
+
+  req.on("end", async () => {
+    if (aborted) return;
+    try {
+      const payload = JSON.parse(rawBody || "{}");
+      const targetUrl = typeof payload.url === "string" ? payload.url : "";
+      if (!targetUrl) {
+        res.writeHead(400, {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        });
+        res.end(JSON.stringify({ error: { message: "Missing target url" } }));
+        return;
+      }
+
+      const parsedUrl = new URL(targetUrl);
+      if (parsedUrl.protocol !== "https:" || !ALLOWED_AI_HOSTS.has(parsedUrl.hostname)) {
+        res.writeHead(400, {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        });
+        res.end(
+          JSON.stringify({
+            error: { message: `Disallowed AI provider host: ${parsedUrl.hostname}` }
+          })
+        );
+        return;
+      }
+
+      const upstreamHeaders = {
+        "Content-Type": "application/json",
+        "User-Agent": "codemirror-agent/1.0"
+      };
+
+      if (payload.headers && typeof payload.headers === "object") {
+        for (const [k, v] of Object.entries(payload.headers)) {
+          if (typeof v === "string" && v.length > 0) {
+            upstreamHeaders[k] = v;
+          }
+        }
+      }
+
+      const upstreamBody =
+        typeof payload.body === "string" ? payload.body : JSON.stringify(payload.body ?? {});
+
+      const upstreamRes = await fetchFn(parsedUrl.toString(), {
+        method: "POST",
+        headers: upstreamHeaders,
+        body: upstreamBody
+      });
+
+      const text = await upstreamRes.text();
+      res.writeHead(upstreamRes.status, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      });
+      res.end(text);
+    } catch (err) {
+      res.writeHead(502, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      });
+      res.end(
+        JSON.stringify({
+          error: { message: err instanceof Error ? err.message : "AI proxy request failed" }
+        })
+      );
+    }
+  });
 }
 
 if (require.main === module) {
@@ -330,5 +518,7 @@ module.exports = {
   createRoomStore,
   FRAME_TYPE_DELTA,
   FRAME_TYPE_SNAPSHOT,
+  FRAME_TYPE_DESTROY,
+  ALLOWED_AI_HOSTS,
   ROOM_TTL_MS
 };

@@ -15,7 +15,9 @@ import {
   buildSystemPromptWithContext,
   ChatMessage,
   CODING_ONLY_SYSTEM_PROMPT,
-  detectProviderFromKey
+  detectProviderFromKey,
+  resolveProvider,
+  sendCodingChatCompletion
 } from "../ai";
 import {
   addCursorsToLineEnds,
@@ -436,15 +438,63 @@ describe("Session Countdown Formatter & Supported Languages", () => {
   });
 
   it("auto-detects BYOK AI providers, enforces coding-only system prompt with live editor context, and executes host-proxied room chat over Yjs", async () => {
+    expect(detectProviderFromKey("oc_sk_testOpenCodeKey")).toBe("opencode");
     expect(detectProviderFromKey("sk-ant-api03-test")).toBe("anthropic");
     expect(detectProviderFromKey("AIzaSyTestGeminiKey")).toBe("gemini");
+    expect(detectProviderFromKey("sk-or-v1-testOpenRouter")).toBe("openrouter");
+    expect(detectProviderFromKey("gsk_testGroqKey")).toBe("groq");
+    expect(detectProviderFromKey("xai-testGrokKey")).toBe("xai");
     expect(detectProviderFromKey("sk-proj-testOpenAiKey")).toBe("openai");
+    expect(resolveProvider("oc_sk_testOpenCodeKey", "opencode-go")).toBe("opencode-go");
+    expect(resolveProvider("sk-custom", "deepseek")).toBe("deepseek");
 
     const prompt = buildSystemPromptWithContext("kotlin", "val state = MutableStateFlow(0)");
     expect(prompt).toContain(CODING_ONLY_SYSTEM_PROMPT);
     expect(prompt).toContain("trip planning");
     expect(prompt).toContain("Current editor language: kotlin");
     expect(prompt).toContain("val state = MutableStateFlow(0)");
+
+    // Verify OpenCode (opencode.ai) headers and automatic fallback to OpenCode Go on auto-detect
+    const calledUrls: string[] = [];
+    const calledHeaders: Record<string, string>[] = [];
+    const openCodeFetch: typeof fetch = async (input, init) => {
+      const urlStr = String(input);
+      calledUrls.push(urlStr);
+      calledHeaders.push((init?.headers as Record<string, string>) || {});
+
+      if (urlStr.includes("/inference/openai/v1/chat/completions")) {
+        return {
+          ok: false,
+          status: 403,
+          json: async () => ({ error: { message: "Subscription is OpenCode Go" } })
+        } as Response;
+      }
+
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [{ message: { content: "OpenCode Go response Ready." } }]
+        })
+      } as Response;
+    };
+
+    const openCodeReply = await sendCodingChatCompletion({
+      apiKey: "oc_sk_live_12345",
+      provider: "auto",
+      roomId: "room-abc-123",
+      messages: [{ id: "1", role: "user", content: "Explain coroutines", createdAt: 1 }],
+      codeContext: "suspend fun run() {}",
+      language: "kotlin",
+      fetchImpl: openCodeFetch
+    });
+
+    expect(openCodeReply).toBe("OpenCode Go response Ready.");
+    expect(calledUrls).toEqual([
+      "https://opencode.ai/inference/openai/v1/chat/completions",
+      "https://opencode.ai/inference/go/openai/v1/chat/completions"
+    ]);
+    expect(calledHeaders[0]["x-opencode-session"]).toBe("ses_room-abc-123");
 
     // Verify host-browser responder over Y.Doc (Y.Array("chat") + Y.Map("meta"))
     const doc = new Y.Doc();
@@ -489,5 +539,104 @@ describe("Session Countdown Formatter & Supported Languages", () => {
 
     detach();
     doc.destroy();
+  });
+
+  it("destroys room session on End session (FRAME_TYPE_DESTROY) and proxies opencode.ai via /api/ai-proxy", async () => {
+    let upstreamHitUrl = "";
+    let upstreamHitHeaders: Record<string, string> = {};
+
+    const customRelay = createRelayServer({
+      inMemory: true,
+      fetchImpl: async (url: string, init: { headers?: Record<string, string> }) => {
+        upstreamHitUrl = url;
+        upstreamHitHeaders = init?.headers || {};
+        return {
+          status: 200,
+          text: async () =>
+            JSON.stringify({
+              choices: [{ message: { content: "Proxied OpenCode answer" } }]
+            })
+        };
+      }
+    });
+
+    await new Promise<void>((resolve) => {
+      customRelay.server.listen(0, "127.0.0.1", () => resolve());
+    });
+    const addr = customRelay.server.address();
+    const customHttpBase = `http://127.0.0.1:${addr.port}`;
+    const customWsBase = `ws://127.0.0.1:${addr.port}/ws`;
+
+    try {
+      // 1. Test stateless /api/ai-proxy pass-through for opencode.ai
+      const proxiedReply = await sendCodingChatCompletion({
+        apiKey: "oc_sk_proxy_test",
+        provider: "opencode",
+        roomId: "testroom",
+        messages: [{ id: "m1", role: "user", content: "Fix bug", createdAt: 1 }],
+        codeContext: "val x = 1",
+        language: "kotlin",
+        proxyUrl: `${customHttpBase}/api/ai-proxy`
+      });
+
+      expect(proxiedReply).toBe("Proxied OpenCode answer");
+      expect(upstreamHitUrl).toBe("https://opencode.ai/inference/openai/v1/chat/completions");
+      expect(upstreamHitHeaders["User-Agent"]).toBe("codemirror-agent/1.0");
+      expect(upstreamHitHeaders["x-opencode-session"]).toBe("ses_testroom");
+
+      // Disallowed SSRF host is rejected with 400
+      const disallowedRes = await fetch(`${customHttpBase}/api/ai-proxy`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: "https://evil.example.com/v1/chat", body: {} })
+      });
+      expect(disallowedRes.status).toBe(400);
+
+      // 2. Test End Session room destruction (deletes room & notifies peers)
+      const { roomId, hashKey } = await createSession();
+      const key = await importKeyFromHash(hashKey);
+
+      const docA = new Y.Doc();
+      const docB = new Y.Doc();
+      let peerBEnded = false;
+
+      const providerA = new EncryptedWsProvider(docA, roomId, key, {
+        wsUrl: customWsBase,
+        WebSocketPolyfill: WebSocket as unknown as typeof globalThis.WebSocket
+      });
+      const providerB = new EncryptedWsProvider(docB, roomId, key, {
+        wsUrl: customWsBase,
+        WebSocketPolyfill: WebSocket as unknown as typeof globalThis.WebSocket,
+        onSessionEnded: () => {
+          peerBEnded = true;
+        }
+      });
+
+      await waitForCondition(
+        () => providerA.getStatus() === "connected" && providerB.getStatus() === "connected"
+      );
+
+      docA.getText("codemirror").insert(0, "secret interview code");
+      await providerA.flushSnapshotNow();
+      await waitForCondition(() => docB.getText("codemirror").toString() === "secret interview code");
+
+      // Verify room exists in store before End Session
+      const storedBefore = await customRelay.store.getRoom(roomId);
+      expect(storedBefore?.snapshot).toBeTruthy();
+
+      // Host or participant clicks "End session" -> Confirm
+      providerA.destroyRoom();
+
+      await waitForCondition(() => peerBEnded);
+      const storedAfter = await customRelay.store.getRoom(roomId);
+      expect(storedAfter).toBeNull();
+      expect(customRelay.rooms.has(roomId)).toBe(false);
+
+      providerB.destroy();
+      docA.destroy();
+      docB.destroy();
+    } finally {
+      await new Promise<void>((resolve) => customRelay.server.close(() => resolve()));
+    }
   });
 });

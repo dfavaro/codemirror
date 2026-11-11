@@ -1,6 +1,33 @@
 import * as Y from "yjs";
+import { resolveRelayHttpUrl } from "./provider";
 
-export type AIProvider = "openai" | "anthropic" | "gemini";
+export type AIProvider =
+  | "opencode"
+  | "opencode-go"
+  | "openai"
+  | "anthropic"
+  | "gemini"
+  | "openrouter"
+  | "groq"
+  | "deepseek"
+  | "xai"
+  | "mistral";
+
+export type AIProviderSelection = "auto" | AIProvider;
+
+export const AI_PROVIDER_OPTIONS: { id: AIProviderSelection; label: string }[] = [
+  { id: "auto", label: "Auto-detect" },
+  { id: "opencode", label: "OpenCode (opencode.ai)" },
+  { id: "opencode-go", label: "OpenCode Go" },
+  { id: "openai", label: "OpenAI" },
+  { id: "anthropic", label: "Anthropic Claude" },
+  { id: "gemini", label: "Google Gemini" },
+  { id: "openrouter", label: "OpenRouter" },
+  { id: "groq", label: "Groq" },
+  { id: "deepseek", label: "DeepSeek" },
+  { id: "xai", label: "xAI (Grok)" },
+  { id: "mistral", label: "Mistral" }
+];
 
 export interface ChatMessage {
   id: string;
@@ -25,27 +52,67 @@ const MAX_CODE_CONTEXT_CHARS = 24_000;
 
 /**
  * Auto-detects the AI provider from the API key prefix.
+ * - `oc_sk_...` -> OpenCode (opencode.ai)
  * - `sk-ant-...` -> Anthropic Claude
  * - `AIza...` -> Google Gemini
+ * - `sk-or-...` -> OpenRouter
+ * - `gsk_...` -> Groq
+ * - `xai-...` -> xAI Grok
  * - `sk-...` (or fallback) -> OpenAI
  */
 export function detectProviderFromKey(apiKey: string): AIProvider {
   const trimmed = apiKey.trim();
+  if (trimmed.startsWith("oc_sk_")) {
+    return "opencode";
+  }
   if (trimmed.startsWith("sk-ant-")) {
     return "anthropic";
   }
   if (trimmed.startsWith("AIza")) {
     return "gemini";
   }
+  if (trimmed.startsWith("sk-or-")) {
+    return "openrouter";
+  }
+  if (trimmed.startsWith("gsk_")) {
+    return "groq";
+  }
+  if (trimmed.startsWith("xai-")) {
+    return "xai";
+  }
   return "openai";
+}
+
+export function resolveProvider(
+  apiKey: string,
+  selection?: AIProviderSelection
+): AIProvider {
+  if (selection && selection !== "auto") {
+    return selection;
+  }
+  return detectProviderFromKey(apiKey);
 }
 
 export function getProviderLabel(provider: AIProvider): string {
   switch (provider) {
+    case "opencode":
+      return "OpenCode";
+    case "opencode-go":
+      return "OpenCode Go";
     case "anthropic":
       return "Claude";
     case "gemini":
       return "Gemini";
+    case "openrouter":
+      return "OpenRouter";
+    case "groq":
+      return "Groq";
+    case "deepseek":
+      return "DeepSeek";
+    case "xai":
+      return "xAI Grok";
+    case "mistral":
+      return "Mistral";
     case "openai":
     default:
       return "OpenAI";
@@ -71,15 +138,120 @@ export function buildSystemPromptWithContext(
 
 export interface SendCodingChatOptions {
   apiKey: string;
-  provider?: AIProvider;
+  provider?: AIProviderSelection;
+  roomId?: string;
   messages: ChatMessage[];
   codeContext: string;
   language: string;
   fetchImpl?: typeof fetch;
+  proxyUrl?: string;
+}
+
+interface OpenAICompatibleProviderSpec {
+  endpoint: string;
+  model: string;
+  requiresProxyByDefault: boolean;
+  includeOpenCodeHeaders?: boolean;
+}
+
+const OPENAI_COMPATIBLE_SPECS: Record<
+  Exclude<AIProvider, "anthropic" | "gemini">,
+  OpenAICompatibleProviderSpec
+> = {
+  opencode: {
+    endpoint: "https://opencode.ai/inference/openai/v1/chat/completions",
+    model: "claude-haiku-4-5",
+    requiresProxyByDefault: true,
+    includeOpenCodeHeaders: true
+  },
+  "opencode-go": {
+    endpoint: "https://opencode.ai/inference/go/openai/v1/chat/completions",
+    model: "claude-haiku-5-5",
+    requiresProxyByDefault: true,
+    includeOpenCodeHeaders: true
+  },
+  openai: {
+    endpoint: "https://api.openai.com/v1/chat/completions",
+    model: "gpt-4o-mini",
+    requiresProxyByDefault: false
+  },
+  openrouter: {
+    endpoint: "https://openrouter.ai/api/v1/chat/completions",
+    model: "openai/gpt-4o-mini",
+    requiresProxyByDefault: false
+  },
+  groq: {
+    endpoint: "https://api.groq.com/openai/v1/chat/completions",
+    model: "llama-3.3-70b-versatile",
+    requiresProxyByDefault: false
+  },
+  deepseek: {
+    endpoint: "https://api.deepseek.com/chat/completions",
+    model: "deepseek-chat",
+    requiresProxyByDefault: true
+  },
+  xai: {
+    endpoint: "https://api.x.ai/v1/chat/completions",
+    model: "grok-3-mini",
+    requiresProxyByDefault: true
+  },
+  mistral: {
+    endpoint: "https://api.mistral.ai/v1/chat/completions",
+    model: "mistral-small-latest",
+    requiresProxyByDefault: true
+  }
+};
+
+async function executeProviderRequest(
+  targetUrl: string,
+  headers: Record<string, string>,
+  bodyObj: unknown,
+  options: {
+    fetchFn: typeof fetch;
+    useProxyByDefault: boolean;
+    customFetchInjected: boolean;
+    proxyUrl?: string;
+  }
+): Promise<Response> {
+  const effectiveProxyUrl = options.proxyUrl || resolveRelayHttpUrl("/api/ai-proxy");
+
+  const sendViaProxy = () =>
+    options.fetchFn(effectiveProxyUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        url: targetUrl,
+        headers,
+        body: bodyObj
+      })
+    });
+
+  if (options.proxyUrl || (options.useProxyByDefault && !options.customFetchInjected)) {
+    return sendViaProxy();
+  }
+
+  try {
+    return await options.fetchFn(targetUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...headers
+      },
+      body: JSON.stringify(bodyObj)
+    });
+  } catch (err) {
+    if (!options.customFetchInjected) {
+      return sendViaProxy();
+    }
+    throw err;
+  }
 }
 
 /**
- * Executes a direct browser BYOK chat completion against OpenAI, Anthropic, or Google Gemini.
+ * Executes a BYOK chat completion against OpenCode (Pay-as-you-go & Go), OpenAI,
+ * Anthropic Claude, Google Gemini, OpenRouter, Groq, DeepSeek, xAI Grok, or Mistral.
  */
 export async function sendCodingChatCompletion(
   options: SendCodingChatOptions
@@ -89,8 +261,9 @@ export async function sendCodingChatCompletion(
     throw new Error("Missing AI API key.");
   }
 
-  const provider = options.provider ?? detectProviderFromKey(apiKey);
+  const provider = resolveProvider(apiKey, options.provider);
   const fetchFn = options.fetchImpl ?? globalThis.fetch;
+  const customFetchInjected = Boolean(options.fetchImpl);
   const systemPrompt = buildSystemPromptWithContext(
     options.language,
     options.codeContext
@@ -100,52 +273,15 @@ export async function sendCodingChatCompletion(
     .filter((m) => m.content.trim().length > 0 && m.status !== "error")
     .slice(-20);
 
-  if (provider === "openai") {
-    const response = await fetchFn("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        temperature: 0.2,
-        messages: [
-          { role: "system", content: systemPrompt },
-          ...history.map((m) => ({
-            role: m.role,
-            content: m.content
-          }))
-        ]
-      })
-    });
-
-    const data = (await response.json().catch(() => ({}))) as {
-      choices?: { message?: { content?: string } }[];
-      error?: { message?: string };
-    };
-
-    if (!response.ok) {
-      throw new Error(data.error?.message || `OpenAI HTTP ${response.status}`);
-    }
-
-    const reply = data.choices?.[0]?.message?.content?.trim();
-    if (!reply) {
-      throw new Error("Empty response from OpenAI.");
-    }
-    return reply;
-  }
-
   if (provider === "anthropic") {
-    const response = await fetchFn("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
+    const response = await executeProviderRequest(
+      "https://api.anthropic.com/v1/messages",
+      {
         "x-api-key": apiKey,
         "anthropic-version": "2023-06-01",
         "anthropic-dangerous-direct-browser-access": "true"
       },
-      body: JSON.stringify({
+      {
         model: "claude-3-5-sonnet-latest",
         max_tokens: 2048,
         system: systemPrompt,
@@ -153,8 +289,14 @@ export async function sendCodingChatCompletion(
           role: m.role,
           content: m.content
         }))
-      })
-    });
+      },
+      {
+        fetchFn,
+        useProxyByDefault: false,
+        customFetchInjected,
+        proxyUrl: options.proxyUrl
+      }
+    );
 
     const data = (await response.json().catch(() => ({}))) as {
       content?: { type?: string; text?: string }[];
@@ -177,55 +319,132 @@ export async function sendCodingChatCompletion(
     return reply;
   }
 
-  // Google Gemini (`gemini-2.5-flash`)
-  const geminiEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(
-    apiKey
-  )}`;
-  const response = await fetchFn(geminiEndpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      systemInstruction: {
-        parts: [{ text: systemPrompt }]
+  if (provider === "gemini") {
+    const geminiEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(
+      apiKey
+    )}`;
+    const response = await executeProviderRequest(
+      geminiEndpoint,
+      {},
+      {
+        systemInstruction: {
+          parts: [{ text: systemPrompt }]
+        },
+        contents: history.map((m) => ({
+          role: m.role === "assistant" ? "model" : "user",
+          parts: [{ text: m.content }]
+        })),
+        generationConfig: {
+          temperature: 0.2
+        }
       },
-      contents: history.map((m) => ({
-        role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: m.content }]
-      })),
-      generationConfig: {
-        temperature: 0.2
+      {
+        fetchFn,
+        useProxyByDefault: false,
+        customFetchInjected,
+        proxyUrl: options.proxyUrl
       }
-    })
-  });
+    );
+
+    const data = (await response.json().catch(() => ({}))) as {
+      candidates?: { content?: { parts?: { text?: string }[] } }[];
+      error?: { message?: string };
+    };
+
+    if (!response.ok) {
+      throw new Error(data.error?.message || `Gemini HTTP ${response.status}`);
+    }
+
+    const reply = data.candidates?.[0]?.content?.parts
+      ?.map((p) => p.text ?? "")
+      .join("\n")
+      .trim();
+
+    if (!reply) {
+      throw new Error("Empty response from Gemini.");
+    }
+    return reply;
+  }
+
+  // OpenAI-compatible providers (OpenCode, OpenCode Go, OpenAI, OpenRouter, Groq, DeepSeek, xAI, Mistral)
+  const callOpenAICompatible = async (
+    targetProvider: Exclude<AIProvider, "anthropic" | "gemini">
+  ): Promise<Response> => {
+    const spec = OPENAI_COMPATIBLE_SPECS[targetProvider];
+    const headers: Record<string, string> = {
+      Authorization: ["Bearer", apiKey].join(" ")
+    };
+    if (spec.includeOpenCodeHeaders) {
+      const sanitizedRoom = (options.roomId || "codemirror").replace(/[^a-zA-Z0-9_-]/g, "");
+      headers["x-opencode-session"] = `ses_${sanitizedRoom}`;
+    }
+
+    return executeProviderRequest(
+      spec.endpoint,
+      headers,
+      {
+        model: spec.model,
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: systemPrompt },
+          ...history.map((m) => ({
+            role: m.role,
+            content: m.content
+          }))
+        ]
+      },
+      {
+        fetchFn,
+        useProxyByDefault: spec.requiresProxyByDefault,
+        customFetchInjected,
+        proxyUrl: options.proxyUrl
+      }
+    );
+  };
+
+  let response = await callOpenAICompatible(provider);
+
+  if (
+    !response.ok &&
+    provider === "opencode" &&
+    (!options.provider || options.provider === "auto")
+  ) {
+    const goFallbackResponse = await callOpenAICompatible("opencode-go").catch(() => null);
+    if (goFallbackResponse && goFallbackResponse.ok) {
+      response = goFallbackResponse;
+    }
+  }
 
   const data = (await response.json().catch(() => ({}))) as {
-    candidates?: { content?: { parts?: { text?: string }[] } }[];
+    choices?: { message?: { content?: string } }[];
     error?: { message?: string };
   };
 
   if (!response.ok) {
-    throw new Error(data.error?.message || `Gemini HTTP ${response.status}`);
+    throw new Error(
+      data.error?.message || `${getProviderLabel(provider)} HTTP ${response.status}`
+    );
   }
 
-  const reply = data.candidates?.[0]?.content?.parts
-    ?.map((p) => p.text ?? "")
-    .join("\n")
-    .trim();
-
+  const reply = data.choices?.[0]?.message?.content?.trim();
   if (!reply) {
-    throw new Error("Empty response from Gemini.");
+    throw new Error(`Empty response from ${getProviderLabel(provider)}.`);
   }
   return reply;
 }
 
 const HOST_KEY_STORAGE_PREFIX = "codemirror_ai_key_";
+const HOST_PROVIDER_STORAGE_PREFIX = "codemirror_ai_provider_";
 
-export function saveHostRoomAiKey(roomId: string, apiKey: string): void {
+export function saveHostRoomAiKey(
+  roomId: string,
+  apiKey: string,
+  provider: AIProviderSelection = "auto"
+): void {
   try {
     if (typeof sessionStorage !== "undefined") {
       sessionStorage.setItem(`${HOST_KEY_STORAGE_PREFIX}${roomId}`, apiKey.trim());
+      sessionStorage.setItem(`${HOST_PROVIDER_STORAGE_PREFIX}${roomId}`, provider);
     }
   } catch {
     // Ignore storage restriction in headless environments
@@ -244,6 +463,31 @@ export function loadHostRoomAiKey(roomId: string): string | null {
   return null;
 }
 
+export function loadHostRoomAiProvider(roomId: string): AIProviderSelection {
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      const value = sessionStorage.getItem(
+        `${HOST_PROVIDER_STORAGE_PREFIX}${roomId}`
+      ) as AIProviderSelection | null;
+      return value || "auto";
+    }
+  } catch {
+    // Ignore storage restriction
+  }
+  return "auto";
+}
+
+export function clearHostRoomAiKey(roomId: string): void {
+  try {
+    if (typeof sessionStorage !== "undefined") {
+      sessionStorage.removeItem(`${HOST_KEY_STORAGE_PREFIX}${roomId}`);
+      sessionStorage.removeItem(`${HOST_PROVIDER_STORAGE_PREFIX}${roomId}`);
+    }
+  } catch {
+    // Ignore storage restriction
+  }
+}
+
 /**
  * Attaches a host-side responder to the room's `Y.Doc`.
  * Only the host browser (which holds the local API key) executes LLM calls when
@@ -252,12 +496,17 @@ export function loadHostRoomAiKey(roomId: string): string | null {
 export function attachHostAiResponder(
   doc: Y.Doc,
   hostApiKey: string,
-  fetchImpl?: typeof fetch
+  fetchImpl?: typeof fetch,
+  options?: {
+    provider?: AIProviderSelection;
+    roomId?: string;
+    proxyUrl?: string;
+  }
 ): () => void {
   const ychat = doc.getArray<ChatMessage>("chat");
   const ymeta = doc.getMap<string>("meta");
   const ytext = doc.getText("codemirror");
-  const provider = detectProviderFromKey(hostApiKey);
+  const provider = resolveProvider(hostApiKey, options?.provider);
 
   // Ensure the room metadata broadcasts that AI is enabled
   doc.transact(() => {
@@ -303,11 +552,13 @@ export function attachHostAiResponder(
       const codeContext = ytext.toString();
       const replyText = await sendCodingChatCompletion({
         apiKey: hostApiKey,
-        provider,
+        provider: options?.provider ?? provider,
+        roomId: options?.roomId,
         messages,
         codeContext,
         language,
-        fetchImpl
+        fetchImpl,
+        proxyUrl: options?.proxyUrl
       });
 
       ychat.push([

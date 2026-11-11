@@ -10,9 +10,16 @@ import {
   IV_BYTE_LENGTH
 } from "../crypto";
 import { EncryptedWsProvider, RoomMetadata } from "../provider";
-import { LANGUAGE_OPTIONS } from "../editor";
+import {
+  addCursorsToLineEnds,
+  handleTabKey,
+  insertBlankLineAbove,
+  LANGUAGE_OPTIONS,
+  VSCODE_KEYBINDINGS
+} from "../editor";
 import { kotlinCompletionSource, swiftCompletionSource } from "../completions";
-import { EditorState } from "@codemirror/state";
+import { EditorSelection, EditorState, TransactionSpec } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import { CompletionContext } from "@codemirror/autocomplete";
 import { formatCountdown } from "../ui";
 
@@ -360,5 +367,64 @@ describe("Session Countdown Formatter & Supported Languages", () => {
     expect(labels3).toContain("padding");
     expect(labels3).toContain("frame");
     expect(labels3).toContain("navigationTitle");
+  });
+
+  it("inserts spaces at the cursor position (not start of row) on Tab when no completion is active, and supports VS Code line/cursor commands", () => {
+    const createMockView = (initialState: EditorState): EditorView => {
+      const mock = {
+        state: initialState,
+        dispatch(...specs: TransactionSpec[]) {
+          mock.state = mock.state.update(...specs).state;
+        }
+      };
+      return mock as unknown as EditorView;
+    };
+
+    const view = createMockView(
+      EditorState.create({
+        doc: "val count = 1",
+        selection: { anchor: 4 } // cursor right after "val "
+      })
+    );
+
+    const handled = handleTabKey(view);
+    expect(handled).toBe(true);
+    // Must insert 2 spaces at cursor position (index 4), NOT at index 0
+    expect(view.state.doc.toString()).toBe("val   count = 1");
+    expect(view.state.selection.main.head).toBe(6);
+
+    // VS Code Cmd+Shift+Enter: insert blank line above preserving indentation
+    const indentedView = createMockView(
+      EditorState.create({
+        doc: "  println(count)",
+        selection: { anchor: 10 }
+      })
+    );
+    expect(insertBlankLineAbove(indentedView)).toBe(true);
+    expect(indentedView.state.doc.toString()).toBe("  \n  println(count)");
+    expect(indentedView.state.selection.main.head).toBe(2);
+
+    // VS Code Shift+Alt+I: add cursors to ends of selected lines
+    const multiLineView = createMockView(
+      EditorState.create({
+        doc: "val a = 1\nval b = 2\nval c = 3",
+        selection: EditorSelection.range(0, 29),
+        extensions: [EditorState.allowMultipleSelections.of(true)]
+      })
+    );
+    expect(addCursorsToLineEnds(multiLineView)).toBe(true);
+    expect(multiLineView.state.selection.ranges.map((r) => r.head)).toEqual([9, 19, 29]);
+
+    // Verify core VS Code shortcuts are registered in VSCODE_KEYBINDINGS
+    const registeredKeys = VSCODE_KEYBINDINGS.map((b) => b.key);
+    expect(registeredKeys).toContain("Tab");
+    expect(registeredKeys).toContain("Mod-d");
+    expect(registeredKeys).toContain("Mod-l");
+    expect(registeredKeys).toContain("Shift-Mod-k");
+    expect(registeredKeys).toContain("Shift-Mod-Enter");
+    expect(registeredKeys).toContain("Alt-ArrowUp");
+    expect(registeredKeys).toContain("Shift-Alt-ArrowDown");
+    expect(registeredKeys).toContain("Mod-/");
+    expect(registeredKeys).toContain("Shift-Alt-a");
   });
 });
